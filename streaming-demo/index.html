@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LLM チャットボット ストリーミングデモ</title>
+
+  <!-- TailwindCSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel（JSX変換用） CDN -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-900 text-white">
+  <div id="root"></div>
+
+  <!--
+    ============================================================
+    React コンポーネント（JSX）
+    Babel がブラウザ内で JSX → JavaScript に変換する
+    ============================================================
+  -->
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    // ============================================================
+    // ストリーミングパーサー
+    // SSE（Server-Sent Events）のレスポンスを解析する
+    // ============================================================
+    async function* streamReader(response) {
+      /**
+       * ReadableStream を使って、ストリーミングデータを読み込む
+       *
+       * 【ReadableStream の仕組み】
+       * レスポンスボディはまだ全体が届いていない状態で読み取り開始できる
+       * チャンク（断片）が届き次第、順次処理する
+       */
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        // read() で次のチャンクを非同期で待つ
+        const { done, value } = await reader.read();
+
+        if (done) break; // ストリーミング終了
+
+        // バイナリ → 文字列に変換
+        const chunk = decoder.decode(value, { stream: true });
+
+        // SSEフォーマットを解析
+        // 各行は "data: {...}" 形式
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6); // "data: " を除去
+
+            if (data.trim() === "[DONE]") {
+              return; // ストリーミング終了シグナル
+            }
+
+            try {
+              const parsed = JSON.parse(data);
+              // OpenAI互換フォーマットからコンテンツを抽出
+              const content = parsed.choices?.[0]?.delta?.content;
+              if (content) {
+                yield content; // 1文字ずつ返す
+              }
+            } catch (e) {
+              // JSON解析エラーは無視（不完全なチャンクの可能性）
+            }
+          }
+        }
+      }
+    }
+
+    // ============================================================
+    // メッセージバブルコンポーネント
+    // ユーザーとアシスタントのメッセージを区別して表示
+    // ============================================================
+    function MessageBubble({ message }) {
+      const isUser = message.role === "user";
+
+      return (
+        <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-4`}>
+          <div
+            className={`
+              max-w-[80%] px-4 py-3 rounded-2xl
+              ${isUser
+                ? "bg-blue-600 text-white rounded-br-md"
+                : "bg-gray-700 text-gray-100 rounded-bl-md"
+              }
+            `}
+          >
+            {/* Markdown風の表示（改行対応） */}
+            <div className="whitespace-pre-wrap break-words">{message.content}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // タイピングインジケーターコンポーネント
+    // アシスタントが返答中の「...」アニメーション
+    // ============================================================
+    function TypingIndicator() {
+      return (
+        <div className="flex justify-start mb-4">
+          <div className="bg-gray-700 text-gray-400 px-4 py-3 rounded-2xl rounded-bl-md">
+            <div className="flex gap-1">
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }}></span>
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }}></span>
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }}></span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // メインアプリコンポーネント
+    // ============================================================
+    function App() {
+      const [messages, setMessages] = useState([]);
+      const [input, setInput] = useState("");
+      const [isLoading, setIsLoading] = useState(false);
+      const messagesEndRef = useRef(null);
+      const abortControllerRef = useRef(null);
+
+      // ====================================================
+      // 自動スクロール
+      // 新しいメッセージが届いたときだけスクロールする
+      // ====================================================
+      useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      }, [messages]);
+
+      // ====================================================
+      // メッセージ送信 & ストリーミング受信
+      // ====================================================
+      const sendMessage = async () => {
+        if (!input.trim() || isLoading) return;
+
+        // ユーザーメッセージを追加
+        const userMessage = { role: "user", content: input };
+        setMessages((prev) => [...prev, userMessage]);
+
+        const messageToSend = input;
+        setInput(""); // 入力フィールドを即時クリア
+        setIsLoading(true);
+
+        // 空のアシスタントメッセージを追加（ストリーミング中に更新する）
+        const assistantMessage = { role: "assistant", content: "" };
+        setMessages((prev) => [...prev, assistantMessage]);
+
+        // AbortController（リクエスト中断用）
+        abortControllerRef.current = new AbortController();
+
+        try {
+          // ====================================================
+          // 【重要】fetch + ストリーミング
+          // ====================================================
+          const response = await fetch("http://localhost:8000/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: messageToSend }),
+            signal: abortControllerRef.current.signal,
+          });
+
+          // ====================================================
+          // ReadableStream でストリーミングデータを読み込み
+          // ====================================================
+          let accumulatedContent = "";
+
+          for await (const chunk of streamReader(response)) {
+            // 1文字ずつ累積
+            accumulatedContent += chunk;
+
+            // アシスタントメッセージを更新（不可変更新）
+            setMessages((prev) => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                role: "assistant",
+                content: accumulatedContent,
+              };
+              return updated;
+            });
+          }
+        } catch (error) {
+          if (error.name === "AbortError") {
+            console.log("リクエストが中断されました");
+          } else {
+            console.error("エラー:", error);
+            // エラーメッセージを表示
+            setMessages((prev) => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                role: "assistant",
+                content: "エラーが発生しました。バックエンドが起動しているか確認してください。",
+              };
+              return updated;
+            });
+          }
+        } finally {
+          setIsLoading(false);
+          abortControllerRef.current = null;
+        }
+      };
+
+      // ====================================================
+      // リクエスト中断（ストップボタン）
+      // ====================================================
+      const stopGeneration = () => {
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+        }
+      };
+
+      // ====================================================
+      // Enter キーで送信
+      // ====================================================
+      const handleKeyDown = (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      };
+
+      return (
+        <div className="flex flex-col h-screen max-w-3xl mx-auto">
+          {/* ヘッダー */}
+          <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
+            <h1 className="text-xl font-bold">🤖 LLM チャットボット</h1>
+            <p className="text-sm text-gray-400 mt-1">
+              ストリーミングデモ — React + FastAPI + Groq
+            </p>
+          </header>
+
+          {/* メッセージリスト */}
+          <main className="flex-1 overflow-y-auto px-6 py-4">
+            {messages.length === 0 && (
+              <div className="text-center text-gray-500 mt-20">
+                <p className="text-lg">メッセージを送信してね！</p>
+              </div>
+            )}
+
+            {messages.map((msg, i) => (
+              <MessageBubble key={i} message={msg} />
+            ))}
+
+            {/* タイピングインジケーター */}
+            {isLoading && messages[messages.length - 1]?.content === "" && (
+              <TypingIndicator />
+            )}
+
+            <div ref={messagesEndRef} />
+          </main>
+
+          {/* 入力エリア */}
+          <footer className="bg-gray-800 border-t border-gray-700 px-6 py-4">
+            <div className="flex gap-3">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="メッセージを入力..."
+                className="flex-1 bg-gray-700 text-white rounded-xl px-4 py-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+                rows={1}
+                disabled={isLoading}
+              />
+
+              {isLoading ? (
+                <button
+                  onClick={stopGeneration}
+                  className="bg-red-600 hover:bg-red-700 text-white px-6 py-3 rounded-xl font-bold transition-colors"
+                >
+                  停止
+                </button>
+              ) : (
+                <button
+                  onClick={sendMessage}
+                  disabled={!input.trim()}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-6 py-3 rounded-xl font-bold transition-colors"
+                >
+                  送信
+                </button>
+              )}
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // アプリをDOMにマウント
+    // ============================================================
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
