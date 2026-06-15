@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>会話履歴付きチャットボット</title>
+
+  <!-- TailwindCSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel（JSX変換用） CDN -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-900 text-white">
+  <div id="root"></div>
+
+  <!--
+    ============================================================
+    会話履歴付きチャットボット（React版）
+
+    【Streamlit版との対応関係】
+    listing_8.2.streamlit.py  の各行と、このコードの対応を
+    コメントで示している。
+
+    【学習ポイント】
+    1. 会話履歴の管理方法
+    2. ストリーミング受信
+    3. React の状態管理（useState）
+    ============================================================
+  -->
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    // ============================================================
+    // ストリーミングパーサー
+    // SSE（Server-Sent Events）のレスポンスを解析する
+    //
+    // 【Streamlit版との比較】
+    // Streamlit: requests.post(url, stream=True) + r.iter_lines()
+    // React:     fetch() + ReadableStream + reader.read()
+    // ============================================================
+    async function* streamReader(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6);
+            if (data.trim() === "[DONE]") return;
+
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.delta?.content;
+              if (content) yield content;
+            } catch (e) {
+              // JSON解析エラーは無視
+            }
+          }
+        }
+      }
+    }
+
+    // ============================================================
+    // メッセージバブルコンポーネント
+    // 各メッセージをユーザー/アシスタントで区別して表示する
+    //
+    // 【Streamlit版との比較】
+    // Streamlit:
+    //   for chat in st.session_state.chat_history:
+    //       with st.chat_message(chat["role"]):
+    //           st.markdown(chat["content"])
+    //
+    // React:  messages.map(msg => <MessageBubble message={msg} />)
+    // ============================================================
+    function MessageBubble({ message }) {
+      const isUser = message.role === "user";
+
+      return (
+        <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-4`}>
+          <div
+            className={`
+              max-w-[80%] px-4 py-3 rounded-2xl
+              ${isUser
+                ? "bg-blue-600 text-white rounded-br-md"
+                : "bg-gray-700 text-gray-100 rounded-bl-md"
+              }
+            `}
+          >
+            <div className="whitespace-pre-wrap break-words">{message.content}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // タイピングインジケーターコンポーネント
+    // ストリーミング中に「...」を表示する
+    //
+    // 【Streamlit版との比較】
+    // Streamlit:
+    //   placeholder.markdown(full_response + "▌")  ← カーソルアニメーション
+    //
+    // React: ドット3つのアニメーション
+    // ============================================================
+    function TypingIndicator() {
+      return (
+        <div className="flex justify-start mb-4">
+          <div className="bg-gray-700 text-gray-400 px-4 py-3 rounded-2xl rounded-bl-md">
+            <div className="flex gap-1">
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }}></span>
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }}></span>
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }}></span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // メインアプリコンポーネント
+    //
+    // 【Streamlit版との対応関係】
+    //
+    // Streamlit:                                    React:
+    // st.session_state.chat_history = []      →    const [messages, setMessages] = useState([])
+    // st.session_state.chat_history.append()  →    setMessages(prev => [...prev, newMsg])
+    // for chat in history:                    →    messages.map(msg => ...)
+    // ============================================================
+    function App() {
+      // ====================================================
+      // 【会話履歴の状態管理】
+      //
+      // Streamlit版:
+      //   if "chat_history" not in st.session_state:
+      //       st.session_state.chat_history = []
+      //
+      // React版: useState フックで会話履歴を管理
+      //   messages = [
+      //     { role: "user", content: "Reactとは？" },
+      //     { role: "assistant", content: "ReactはUIライブラリです" },
+      //     ...
+      //   ]
+      // ====================================================
+      const [messages, setMessages] = useState([]);
+      const [input, setInput] = useState("");
+      const [isLoading, setIsLoading] = useState(false);
+      const messagesEndRef = useRef(null);
+      const abortControllerRef = useRef(null);
+
+      // ====================================================
+      // 自動スクロール
+      // 新しいメッセージが届いたときだけスクロールする
+      // ====================================================
+      useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      }, [messages]);
+
+      // ====================================================
+      // 【重要】メッセージ送信 & ストリーミング受信
+      //
+      // Streamlit版:
+      //   data = json.dumps({"prompt": prompt})
+      //   with requests.post(url, data=data, stream=True) as r:
+      //       for line in r.iter_lines(decode_unicode=True):
+      //           full_response += line.decode("utf-8")
+      //           placeholder.markdown(full_response + "▌")
+      //
+      // React版: fetch + ReadableStream でストリーミング受信
+      // ====================================================
+      const sendMessage = async () => {
+        if (!input.trim() || isLoading) return;
+
+        // --- 1. ユーザーメッセージを履歴に追加 ---
+        // Streamlit版:
+        //   st.session_state.chat_history.append(
+        //       {"role": "user", "content": user_input}
+        //   )
+        const userMessage = { role: "user", content: input };
+        setMessages((prev) => [...prev, userMessage]);
+
+        const messageToSend = input;
+        setInput(""); // 入力フィールドを即時クリア
+        setIsLoading(true);
+
+        // --- 2. 空のアシスタントメッセージを追加（ストリーミング中に更新する） ---
+        const assistantMessage = { role: "assistant", content: "" };
+        setMessages((prev) => [...prev, assistantMessage]);
+
+        // AbortController（リクエスト中断用）
+        abortControllerRef.current = new AbortController();
+
+        try {
+          // ====================================================
+          // 【重要】バックエンドへのリクエスト
+          //
+          // Streamlit版:
+          //   prompt = "You are an assistant..."
+          //   history = [f'{ch["role"]}: {ch["content"]}' for ch in history]
+          //   prompt += " ".join(history)
+          //   data = json.dumps({"prompt": prompt})
+          //
+          // React版: 会話履歴全体をJSONで送信（よりクリーンな方法）
+          //   { messages: [{role, content}, {role, content}, ...] }
+          // ====================================================
+          const response = await fetch("http://localhost:8000/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              // 会話履歴全体をバックエンドに送信
+              // バックエンドはこれをそのままGroq APIに渡す
+              messages: [...messages, userMessage],
+            }),
+            signal: abortControllerRef.current.signal,
+          });
+
+          // ====================================================
+          // 【ストリーミング受信】
+          //
+          // Streamlit版:
+          //   for line in r.iter_lines(decode_unicode=True):
+          //       full_response += line.decode("utf-8")
+          //       placeholder.markdown(full_response + "▌")
+          //
+          // React版: ReadableStream で1文字ずつ受信
+          // ====================================================
+          let accumulatedContent = "";
+
+          for await (const chunk of streamReader(response)) {
+            accumulatedContent += chunk;
+
+            // アシスタントメッセージを更新（不可変更新）
+            // Streamlit版の placeholder.markdown() に相当
+            setMessages((prev) => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                role: "assistant",
+                content: accumulatedContent,
+              };
+              return updated;
+            });
+          }
+        } catch (error) {
+          if (error.name === "AbortError") {
+            console.log("リクエストが中断されました");
+          } else {
+            console.error("エラー:", error);
+            setMessages((prev) => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                role: "assistant",
+                content: "エラーが発生しました。バックエンドが起動しているか確認してください。",
+              };
+              return updated;
+            });
+          }
+        } finally {
+          setIsLoading(false);
+          abortControllerRef.current = null;
+        }
+      };
+
+      // ====================================================
+      // リクエスト中断（ストップボタン）
+      // ====================================================
+      const stopGeneration = () => {
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+        }
+      };
+
+      // ====================================================
+      // Enter キーで送信
+      // ====================================================
+      const handleKeyDown = (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      };
+
+      return (
+        <div className="flex flex-col h-screen max-w-3xl mx-auto">
+          {/* ヘッダー */}
+          <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
+            <h1 className="text-xl font-bold">🤖 会話履歴付きチャットボット</h1>
+            <p className="text-sm text-gray-400 mt-1">
+              listing_8.2.streamlit.py の React 版
+            </p>
+          </header>
+
+          {/* ====================================================
+              【会話履歴の表示】
+              Streamlit版:
+                for chat in st.session_state.chat_history:
+                    with st.chat_message(chat["role"]):
+                        st.markdown(chat["content"])
+
+              React版: messages.map() で各メッセージを表示
+              ==================================================== */}
+          <main className="flex-1 overflow-y-auto px-6 py-4">
+            {messages.length === 0 && (
+              <div className="text-center text-gray-500 mt-20">
+                <p className="text-lg">メッセージを送信してね！</p>
+              </div>
+            )}
+
+            {messages.map((msg, i) => (
+              <MessageBubble key={i} message={msg} />
+            ))}
+
+            {/* タイピングインジケーター */}
+            {isLoading && messages[messages.length - 1]?.content === "" && (
+              <TypingIndicator />
+            )}
+
+            <div ref={messagesEndRef} />
+          </main>
+
+          {/* 入力エリア */}
+          <footer className="bg-gray-800 border-t border-gray-700 px-6 py-4">
+            <div className="flex gap-3">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="メッセージを入力..."
+                className="flex-1 bg-gray-700 text-white rounded-xl px-4 py-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+                rows={1}
+                disabled={isLoading}
+              />
+
+              {isLoading ? (
+                <button
+                  onClick={stopGeneration}
+                  className="bg-red-600 hover:bg-red-700 text-white px-6 py-3 rounded-xl font-bold transition-colors"
+                >
+                  停止
+                </button>
+              ) : (
+                <button
+                  onClick={sendMessage}
+                  disabled={!input.trim()}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-6 py-3 rounded-xl font-bold transition-colors"
+                >
+                  送信
+                </button>
+              )}
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // アプリをDOMにマウント
+    // ============================================================
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
