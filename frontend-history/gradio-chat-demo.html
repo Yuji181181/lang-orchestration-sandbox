@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gradio風チャットボット</title>
+
+  <!-- TailwindCSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel（JSX変換用） CDN -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-900 text-white">
+  <div id="root"></div>
+
+  <!--
+    ============================================================
+    Gradio風チャットボット（React版）
+
+    【listing_8.3.gradio.py との対応関係】
+    Gradioは history を自動で管理してくれるが、
+    Reactでは手動で管理する必要がある。
+
+    【学習ポイント】
+    1. Gradio特有の履歴フォーマット（[user, assistant] の配列）
+    2. プロンプトの組み立て方（<human> / <bot> フォーマット）
+    3. ジェネレーター関数（yield）の概念
+    ============================================================
+  -->
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    // ============================================================
+    // ストリーミングパーサー
+    // SSE（Server-Sent Events）のレスポンスを解析する
+    // ============================================================
+    async function* streamReader(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6);
+            if (data.trim() === "[DONE]") return;
+
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.delta?.content;
+              if (content) yield content;
+            } catch (e) {
+              // JSON解析エラーは無視
+            }
+          }
+        }
+      }
+    }
+
+    // ============================================================
+    // Gradio版の履歴フォーマット変換関数
+    //
+    // 【Gradio版との対応関係】
+    //
+    // Gradio:
+    //   history_transformer_format = history + [[message, ""]]
+    //   messages = "".join([
+    //       "".join(["\n<human>:" + h, "\n<bot>:" + b])
+    //       for h, b in history_transformer_format
+    //   ])
+    //
+    // React: 同じフォーマットに変換する関数
+    // ============================================================
+    function formatPromptForGradio(messages, newMessage) {
+      /**
+       * Gradio版と同じフォーマットでプロンプトを作成する
+       *
+       * 入力: messages = [{role:"user", content:"Reactとは？"},
+       *                    {role:"assistant", content:"ReactはUIライブラリです"}]
+       *        newMessage = "その詳細を教えて"
+       *
+       * 出力: "\n<human>:Reactとは？\n<bot>:ReactはUIライブラリです
+       *        \n<human>:その詳細を教えて"
+       */
+
+      // Gradioのhistoryは [[user, assistant], [user, assistant], ...] 形式
+      // まずこの形式に変換
+      const historyPairs = [];
+      for (let i = 0; i < messages.length; i += 2) {
+        historyPairs.push([
+            messages[i]?.content || "",      // user
+            messages[i + 1]?.content || ""   // assistant
+        ]);
+      }
+
+      // 新しいメッセージを追加（assistantは空文字）
+      historyPairs.push([newMessage, ""]);
+
+      // <human> / <bot> フォーマットに変換
+      // Gradio版:
+      //   "".join(["\n<human>:" + h, "\n<bot>:" + b] for h, b in ...)
+      const formatted = historyPairs
+          .map(([human, bot]) => `\n<human>:${human}\n<bot>:${bot}`)
+          .join("");
+
+      return formatted;
+    }
+
+    // ============================================================
+    // メッセージバブルコンポーネント
+    // ============================================================
+    function MessageBubble({ message }) {
+      const isUser = message.role === "user";
+
+      return (
+        <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-4`}>
+          <div
+            className={`
+              max-w-[80%] px-4 py-3 rounded-2xl
+              ${isUser
+                ? "bg-blue-600 text-white rounded-br-md"
+                : "bg-gray-700 text-gray-100 rounded-bl-md"
+              }
+            `}
+          >
+            <div className="whitespace-pre-wrap break-words">{message.content}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // タイピングインジケーターコンポーネント
+    // ============================================================
+    function TypingIndicator() {
+      return (
+        <div className="flex justify-start mb-4">
+          <div className="bg-gray-700 text-gray-400 px-4 py-3 rounded-2xl rounded-bl-md">
+            <div className="flex gap-1">
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }}></span>
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }}></span>
+              <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }}></span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // メインアプリコンポーネント
+    //
+    // 【Gradio版との対応関係】
+    //
+    // Gradio:                                   React:
+    // def generate(message, history):     →    const sendMessage = async () => {}
+    //   history + [[message, ""]]         →    formatPromptForGradio(messages, input)
+    //   yield full_response + "▌"        →    setMessages(...)
+    // gr.ChatInterface(generate)          →    <App />
+    // ============================================================
+    function App() {
+      // ====================================================
+      // 【履歴の状態管理】
+      //
+      // Gradio版:
+      //   def generate(message, history):
+      //   → history が自動で渡される
+      //
+      // React版: 手動で管理する
+      // ====================================================
+      const [messages, setMessages] = useState([]);
+      const [input, setInput] = useState("");
+      const [isLoading, setIsLoading] = useState(false);
+      const messagesEndRef = useRef(null);
+      const abortControllerRef = useRef(null);
+
+      useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      }, [messages]);
+
+      // ====================================================
+      // 【重要】メッセージ送信 & ストリーミング受信
+      //
+      // Gradio版:
+      //   def generate(message, history):
+      //       history_transformer_format = history + [[message, ""]]
+      //       messages = "".join([...])  # <human>/<bot> フォーマット
+      //       data = json.dumps({"prompt": messages})
+      //       with requests.post(url, data=data, stream=True) as r:
+      //           for line in r.iter_lines(decode_unicode=True):
+      //               full_response += line.decode("utf-8")
+      //               yield full_response + "▌"
+      //
+      // React版:
+      // ====================================================
+      const sendMessage = async () => {
+        if (!input.trim() || isLoading) return;
+
+        // --- 1. ユーザーメッセージを履歴に追加 ---
+        const userMessage = { role: "user", content: input };
+        setMessages((prev) => [...prev, userMessage]);
+
+        const messageToSend = input;
+        setInput("");
+        setIsLoading(true);
+
+        // --- 2. 空のアシスタントメッセージを追加 ---
+        const assistantMessage = { role: "assistant", content: "" };
+        setMessages((prev) => [...prev, assistantMessage]);
+
+        abortControllerRef.current = new AbortController();
+
+        try {
+          // ====================================================
+          // 【Gradio版との違い】プロンプトのフォーマット
+          //
+          // Gradio版: <human>:質問\n<bot>:回答 の形式に変換
+          // React版:  JSON形式で送信（バックエンドが変換する）
+          // ====================================================
+          const response = await fetch("http://localhost:8000/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              messages: [...messages, userMessage],
+            }),
+            signal: abortControllerRef.current.signal,
+          });
+
+          // --- 3. ストリーミング受信 ---
+          let accumulatedContent = "";
+
+          for await (const chunk of streamReader(response)) {
+            accumulatedContent += chunk;
+
+            setMessages((prev) => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                role: "assistant",
+                content: accumulatedContent,
+              };
+              return updated;
+            });
+          }
+        } catch (error) {
+          if (error.name === "AbortError") {
+            console.log("リクエストが中断されました");
+          } else {
+            console.error("エラー:", error);
+            setMessages((prev) => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                role: "assistant",
+                content: "エラーが発生しました。バックエンドが起動しているか確認してください。",
+              };
+              return updated;
+            });
+          }
+        } finally {
+          setIsLoading(false);
+          abortControllerRef.current = null;
+        }
+      };
+
+      const stopGeneration = () => {
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+        }
+      };
+
+      const handleKeyDown = (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      };
+
+      return (
+        <div className="flex flex-col h-screen max-w-3xl mx-auto">
+          {/* ヘッダー */}
+          <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
+            <h1 className="text-xl font-bold">🤖 Gradio風チャットボット</h1>
+            <p className="text-sm text-gray-400 mt-1">
+              listing_8.3.gradio.py の React 版
+            </p>
+          </header>
+
+          {/* メッセージリスト */}
+          <main className="flex-1 overflow-y-auto px-6 py-4">
+            {messages.length === 0 && (
+              <div className="text-center text-gray-500 mt-20">
+                <p className="text-lg">メッセージを送信してね！</p>
+              </div>
+            )}
+
+            {messages.map((msg, i) => (
+              <MessageBubble key={i} message={msg} />
+            ))}
+
+            {isLoading && messages[messages.length - 1]?.content === "" && (
+              <TypingIndicator />
+            )}
+
+            <div ref={messagesEndRef} />
+          </main>
+
+          {/* 入力エリア */}
+          <footer className="bg-gray-800 border-t border-gray-700 px-6 py-4">
+            <div className="flex gap-3">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="メッセージを入力..."
+                className="flex-1 bg-gray-700 text-white rounded-xl px-4 py-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+                rows={1}
+                disabled={isLoading}
+              />
+
+              {isLoading ? (
+                <button
+                  onClick={stopGeneration}
+                  className="bg-red-600 hover:bg-red-700 text-white px-6 py-3 rounded-xl font-bold transition-colors"
+                >
+                  停止
+                </button>
+              ) : (
+                <button
+                  onClick={sendMessage}
+                  disabled={!input.trim()}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-6 py-3 rounded-xl font-bold transition-colors"
+                >
+                  送信
+                </button>
+              )}
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // アプリをDOMにマウント
+    // ============================================================
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
