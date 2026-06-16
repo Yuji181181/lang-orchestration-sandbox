@@ -1,44 +1,107 @@
-import os
-import tiktoken
-from datasets import load_dataset
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings.openai import OpenAIEmbeddings
-from pinecone import Pinecone, ServerlessSpec
-from sentence_transformers import SentenceTransformer
+"""
+RAGサンプル - データ格納（インデックス作成）フェーズ
+================================================================
+Wikipediaの記事をベクトル化し、Pinecone（クラウドベクトルDB）に格納する処理。
+RAGの「データを準備する」側のコード。
 
-from tqdm.auto import tqdm
-from uuid import uuid4
+前提知識:
+- 埋め込み（Embedding）: テキストを数値のベクトル（配列）に変換する処理。
+  例: "りんごは赤い" → [0.12, -0.45, 0.78, ...]（1536次元の浮動小数点数配列）
+  これにより、テキストの「意味の近さ」を数値で比較できるようになる。
+- Pinecone: クラウド上のベクトルDB。APIキーがあればサーバ構築不要で利用可能。
+- チャンク分割: 長いドキュメントをLLMの処理に適した短いブロックに分割する処理。
+"""
 
-# get openai api key from platform.openai.com
+# ==============================
+# 標準ライブラリ
+# ==============================
+import os              # 環境変数の読み込み用
+from uuid import uuid4 # 一意のID生成用（ベクトルごとにユニークなIDが必要）
+
+# ==============================
+# 外部ライブラリ
+# ==============================
+import tiktoken                                    # OpenAI系のトークンカウンター
+from datasets import load_dataset                  # HuggingFaceのデータセット読み込み
+from langchain.text_splitter import RecursiveCharacterTextSplitter  # テキスト分割
+from langchain.embeddings.openai import OpenAIEmbeddings           # OpenAI埋め込みモデル
+from pinecone import Pinecone, ServerlessSpec     # Pineconeクライアント
+from sentence_transformers import SentenceTransformer             # ローカル埋め込みモデル（代替用）
+from tqdm.auto import tqdm                         # プログレスバー表示
+
+# ==============================
+# APIキーの取得
+# ==============================
+# OpenAIのAPIキー（埋め込みモデルの利用に必要）
+# platform.openai.com の「API Keys」ページから取得
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# find API key in console at app.pinecone.io
+
+# PineconeのAPIキー（ベクトルDBの利用に必要）
+# app.pinecone.io のコンソールから取得
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-# find ENV (cloud region) next to API key in console
-# PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
 
+
+# ==============================
+# Pineconeクライアントの初期化
+# ==============================
+# APIキーを渡してPineconeサービスに接続するクライアントを作成
 pc = Pinecone(api_key=PINECONE_API_KEY)
-
-# pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
 
 
 class WikiDataIngestion:
+    """
+    Wikipediaのデータを取得し、ベクトル化してPineconeに格納するクラス。
+
+    処理の流れ:
+      1. Wikipedia記事を取得（HuggingFace datasets）
+      2. 各記事を小さなチャンク（ブロック）に分割
+      3. 各チャンクを埋め込みモデルでベクトルに変換
+      4. ベクトルとメタデータをPineconeにアップロード
+
+    このクラスは「インデックス作成（データ格納）」を担当し、
+    検索・回答生成は別のファイル（listing_8.5）で行う。
+    """
+
     def __init__(
         self,
-        index,
-        wikidata=None,
-        embedder=None,
-        tokenizer=None,
-        text_splitter=None,
-        batch_limit=100,
+        index,             # Pineconeのインデックスオブジェクト（格納先のテーブルのようなもの）
+        wikidata=None,     # Wikipediaデータセット（Noneなら自動でロード）
+        embedder=None,     # 埋め込みモデル（NoneならOpenAIのデフォルトモデルを使用）
+        tokenizer=None,    # トークナイザー（文字数カウント用）
+        text_splitter=None,# テキスト分割器（Noneならデフォルト設定で作成）
+        batch_limit=100,   # 1回のアップロードで送信するチャンク数の上限
     ):
+        # --- Pineconeインデックス（書き込み先） ---
         self.index = index
+
+        # --- Wikipediaデータセット ---
+        # HuggingFaceのdatasetsライブラリから「simple wikipedia」を取得
+        # split="train[:10000]" で最初の10,000件のみ使用（全件は数百万人件）
+        # 各レコードには "id", "url", "title", "text" が含まれる
         self.wikidata = wikidata or load_dataset(
             "wikipedia", "20220301.simple", split="train[:10000]"
         )
+
+        # --- 埋め込みモデル ---
+        # OpenAIの「text-embedding-ada-002」を使用
+        # 入力テキストを1536次元のベクトルに変換する
+        # 同じ意味のテキストは近いベクトルになり、意味が離れたテキストは遠いベクトルになる
         self.embedder = embedder or OpenAIEmbeddings(
             model="text-embedding-ada-002", openai_api_key=OPENAI_API_KEY
         )
+
+        # --- トークナイザー ---
+        # tiktokenの「cl100k_base」エンコーディングを使用
+        # テキストを「トークン（LLMの最小処理単位）」に分割し、その数をカウントする
+        # 例: "Hello world" → ["Hello", " world"] → 2トークン
         self.tokenizer = tokenizer or tiktoken.get_encoding("cl100k_base")
+
+        # --- テキスト分割器 ---
+        # RecursiveCharacterTextSplitter: 再帰的にテキストを分割する
+        # chunk_size=400: 1チャンク最大400トークン
+        # chunk_overlap=20: チャンク間で20トークン重複させる（文脈の連続性を保持）
+        # separators: 改行→スペース→文字の順で分割ポイントを探す
+        #   （\n\n で分けられなければ \n、それでもダメなら " "、最後は文字単位）
         self.text_splitter = (
             text_splitter
             or RecursiveCharacterTextSplitter(
@@ -48,22 +111,67 @@ class WikiDataIngestion:
                 separators=["\n\n", "\n", " ", ""],
             )
         )
+
+        # --- バッチサイズ ---
+        # 1回のAPI呼び出しでPineconeに送信するチャンク数の上限
+        # 大量データを一度に送るとAPIエラーになるため、バッチ単位で処理する
         self.batch_limit = batch_limit
 
     def token_length(self, text):
+        """
+        テキストのトークン数を返す関数。
+        text_splitterの length_function として使用される。
+
+        Args:
+            text (str): カウント対象のテキスト
+        Returns:
+            int: トークン数
+        """
         tokens = self.tokenizer.encode(text, disallowed_special=())
         return len(tokens)
 
     def get_wiki_metadata(self, page):
+        """
+        Wikipedia記事からメタデータ（付随情報）を抽出する。
+
+        Pineconeにベクトルを格納する際、ベクトルだけでなくメタデータも一緒に保存できる。
+        検索結果としてベクトルが返されたときに、元の記事の情報を確認できる。
+
+        Args:
+            page (dict): 1件のWikipedia記事
+        Returns:
+            dict: メタデータ（記事ID、URL、タイトル）
+        """
         return {
-            "wiki-id": str(page["id"]),
-            "source": page["url"],
-            "title": page["title"],
+            "wiki-id": str(page["id"]),   # Wikipediaの固有ID
+            "source": page["url"],         # 記事のURL（出典表示用）
+            "title": page["title"],        # 記事のタイトル
         }
 
     def split_texts_and_metadatas(self, page):
+        """
+        1記事を複数チャンクに分割し、各チャンクに対応するメタデータを生成する。
+
+        例:
+          入力: "Johannes Gutenbergは..."（2000文字の記事）
+          出力: texts = ["Johannes Gutenbergは...", "彼は活字を...", ...]（5チャンク）
+                 metadatas = [{chunk:0, text:...}, {chunk:1, text:...}, ...]
+
+        Args:
+            page (dict): 1件のWikipedia記事
+        Returns:
+            tuple: (チャンクのリスト, メタデータのリスト)
+        """
+        # 基本メタデータを取得（記事ID、URL、タイトル）
         basic_metadata = self.get_wiki_metadata(page)
+
+        # 記事の本文をチャンクに分割
         texts = self.text_splitter.split_text(page["text"])
+
+        # 各チャンクにメタデータを付与
+        # chunk: チャンク番号（0, 1, 2...）
+        # text: チャンクのテキスト本文（検索結果確認用）
+        # **basic_metadata: 記事ID、URL、タイトルを展開して結合
         metadatas = [
             {"chunk": j, "text": text, **basic_metadata}
             for j, text in enumerate(texts)
@@ -71,212 +179,125 @@ class WikiDataIngestion:
         return texts, metadatas
 
     def upload_batch(self, texts, metadatas):
+        """
+        チャンクのバッチをPineconeにアップロードする。
+
+        処理内容:
+          1. 各チャンクにユニークなIDを生成
+          2. 埋め込みモデルでチャンクをベクトルに変換
+          3. ID、ベクトル、メタデータをセットでPineconeに送信
+
+        Args:
+            texts (list[str]): チャンクのテキストリスト
+            metadatas (list[dict]): 各チャンクに対応するメタデータリスト
+        """
+        # 各チャンクにユニークなIDを生成（UUID v4）
+        # PineconeではIDで上書き（upsert）されるため、重複しないIDが必要
         ids = [str(uuid4()) for _ in range(len(texts))]
+
+        # テキストのリストをベクトルのリストに変換
+        # embed_documents: 複数テキストを一括でベクトル化する（1536次元×N件）
         embeddings = self.embedder.embed_documents(texts)
+
+        # zipでID、ベクトル、メタデータを組み合わせ、Pineconeに一括送信
+        # upsert: 既存IDなら上書き、新規IDなら挿入
         self.index.upsert(vectors=zip(ids, embeddings, metadatas))
 
     def batch_upload(self):
-        batch_texts = []
-        batch_metadatas = []
+        """
+        全データをバッチ単位でPineconeにアップロードする。
 
+        10,000件のWikipedia記事を100件ずつバッチにまとめ、
+        1バッチごとにembed → upsertを行う。
+        これにより、大量データを効率的かつ安定的に格納できる。
+        """
+        batch_texts = []      # 現在のバッチに含まれるテキスト
+        batch_metadatas = []  # 現在のバッチに含まれるメタデータ
+
+        # tqdmで進捗バーを表示しながら全記事を処理
         for page in tqdm(self.wikidata):
+            # 1記事をチャンクに分割し、メタデータを生成
             texts, metadatas = self.split_texts_and_metadatas(page)
 
+            # バッチに追加
             batch_texts.extend(texts)
             batch_metadatas.extend(metadatas)
 
+            # バッチが上限（100チャンク）に達したら、Pineconeに送信
             if len(batch_texts) >= self.batch_limit:
                 self.upload_batch(batch_texts, batch_metadatas)
+                # 送信後、バッチをクリアして次のバッチへ
                 batch_texts = []
                 batch_metadatas = []
 
+        # 最後に残ったチャンク（100件未満）を送信
         if len(batch_texts) > 0:
             self.upload_batch(batch_texts, batch_metadatas)
 
 
+# ==============================
+# メイン実行部分
+# ==============================
 if __name__ == "__main__":
+    # --- Pineconeインデックスの作成 ---
+    # インデックスはRDBで言う「テーブル」に相当
     index_name = "pincecone-llm-example"
 
-    # Create index if it doesn't exist
+    # 指定名のインデックスが存在しなければ作成
     if index_name not in pc.list_indexes().names():
         pc.create_index(
             name=index_name,
-            metric="cosine",
-            dimension=1536,  # 1536 dim of text-embedding-ada-002
-            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            metric="cosine",       # 類似度計算方法: コサイン類似度（-1〜1の範囲）
+            dimension=1536,        # ベクトルの次元数（text-embedding-ada-002の出力次元）
+            spec=ServerlessSpec(
+                cloud="aws",       # クラウドプロバイダ: AWS
+                region="us-east-1" # リージョン: 米国東部
+            ),
         )
 
-    # Connect to index and describe stats
+    # インデックスへの接続を取得
     index = pc.Index(index_name)
+    # インデックスの現在の状態を表示（格納件数など）
     print(index.describe_index_stats())
 
-    # Use a generic embedder if an openai api key is not provided
+    # --- 埋め込みモデルの選択 ---
+    # OpenAI APIキーが設定されている場合はOpenAIのモデルを使用
+    # 設定されていない場合はローカルのSentenceTransformerを使用
+    # （SentenceTransformerは無料でAPIキー不要だが、精度が異なる場合がある）
     embedder = None
     if not OPENAI_API_KEY:
+        # ローカル埋め込みモデル（日本語・英語・韓国語対応）
+        # 出力次元も1536（OpenAIと互換性あり）
         embedder = SentenceTransformer(
             "sangmini/msmarco-cotmae-MiniLM-L12_en-ko-ja"
-        )  # Also 1536 dim
+        )
+        # SentenceTransformerのencode()をLangChainのインターフェースに合わせてラップ
+        # embed_documents()メソッドを追加し、戻り値をリスト型に変換
         embedder.embed_documents = lambda *args, **kwargs: embedder.encode(
             *args, **kwargs
         ).tolist()
 
-    # Ingest data and describe stats anew
+    # --- データの取り込みと格納 ---
+    # WikiDataIngestionクラスでWikipedia → Pineconeへの格納を実行
     wiki_data_ingestion = WikiDataIngestion(index, embedder=embedder)
     wiki_data_ingestion.batch_upload()
+
+    # 格納後のインデックス状態を表示（格納件数が増えているはず）
     print(index.describe_index_stats())
 
-    # Make a query
+    # --- 類似検索テスト ---
+    # "Did Johannes Gutenberg invent the printing press?" という質問で検索
+    # 1. 質問テキストをベクトルに変換
+    # 2. Pinecone上で最も近いベクトルを上位3件取得
+    # 3. メタデータ（記事本文、タイトル、URL等）も含めて返す
     query = "Did Johannes Gutenberg invent the printing press?"
     embeddings = wiki_data_ingestion.embedder.embed_documents(query)
     results = index.query(vector=embeddings, top_k=3, include_metadata=True)
     print(results)
-    # {'matches': [{'id': '18e2ab0a-f627-436a-b1ab-ed89b5b29c3b',
-    #     'metadata': {'chunk': 0.0,
-    #                 'source': 'https://simple.wikipedia.org/wiki/Johannes%20Gutenberg',
-    #                 'text': 'Johannes Gensfleisch zur Laden zum '
-    #                         'Gutenberg (more commonly known as Johannes '
-    #                         'Gutenberg) (1390s – 3 February 1468), was '
-    #                         'a German metal-worker and inventor. He is '
-    #                         'famous for his work in printing in the '
-    #                         '1450s, and is specifically known for '
-    #                         'inventing typography.\n'
-    #                         '\n'
-    #                         'Gutenberg was born in Mainz, Germany, as '
-    #                         'the son of a merchant, Friele Gensfleisch '
-    #                         "zur Laden. Gutenberg's father took the "
-    #                         'surname "zum Gutenberg" after the name of '
-    #                         'the place they now lived.\n'
-    #                         '\n'
-    #                         'Gutenberg invented a sort of metal alloy '
-    #                         'for printing; inks; a way to fix type '
-    #                         '(metal letters) very accurately; and a new '
-    #                         'sort of printing press. He took the idea '
-    #                         'for his printing press from the presses '
-    #                         'wine-makers used. Many people say '
-    #                         'Gutenberg invented printing with moveable '
-    #                         'type, but it was already invented in China '
-    #                         'before that: see printing.\n'
-    #                         '\n'
-    #                         'Before movable type, people used block '
-    #                         'printing, where the printer prints a whole '
-    #                         'page from one piece of metal or wood. With '
-    #                         'movable type, the printer makes a letter '
-    #                         '(A, B, C ...) from a piece of metal or '
-    #                         'wood, and can use it again and again in '
-    #                         "different words. Together, all Gutenberg's "
-    #                         'inventions made printing fast. In '
-    #                         'Renaissance Europe, the improved '
-    #                         'information technology made an information '
-    #                         'explosion – in a short time, people '
-    #                         'printed many new books about many topics.',
-    #                 'title': 'Johannes Gutenberg',
-    #                 'wiki-id': '5675'},
-    #     'score': 0.871572554,
-    #     'values': []},
-    #     {'id': '97f55ce5-a5f4-40d8-8886-1bb459a97984',
-    #     'metadata': {'chunk': 3.0,
-    #                 'source': 'https://simple.wikipedia.org/wiki/Pencil',
-    #                 'text': 'American colonists imported pencils from '
-    #                         'Europe until after the American '
-    #                         'Revolution. Benjamin Franklin advertised '
-    #                         'pencils for sale in his Pennsylvania '
-    #                         'Gazette in 1729, and George Washington '
-    #                         'used a three-inch pencil when he surveyed '
-    #                         'the Ohio Territory in 1762. It is said '
-    #                         'that William Munroe, a cabinetmaker in '
-    #                         'Concord, Massachusetts, made the first '
-    #                         'American wood pencils in 1812. This was '
-    #                         'not the only pencil-making occurring in '
-    #                         'Concord.  Henry David Thoreau discovered '
-    #                         'how to make a good pencil out of inferior '
-    #                         'graphite using clay as the binder; this '
-    #                         "invention was prompted by his father's "
-    #                         'pencil factory in Concord, which employed '
-    #                         'graphite found in New Hampshire in 1821 by '
-    #                         'Charles Dunbar.\n'
-    #                         '\n'
-    #                         'Eraser attached \n'
-    #                         'On 30 March 1858, Hymen Lipman received '
-    #                         'the first patent for attaching an eraser '
-    #                         'to the end of a pencil. In 1862 Lipman '
-    #                         'sold his patent to Joseph Reckendorfer for '
-    #                         '$100,000, who went to sue the pencil '
-    #                         'manufacturer Faber-Castell for '
-    #                         'infringement. In 1875, the Supreme Court '
-    #                         'of the United States ruled against '
-    #                         'Reckendorfer declaring the patent '
-    #                         'invalid.\n'
-    #                         '\n'
-    #                         'The metal band used to mate the eraser '
-    #                         'with pencil is called a ferrule.\n'
-    #                         '\n'
-    #                         'Other attempts \n'
-    #                         'The first attempt to manufacture graphite '
-    #                         'sticks from powdered graphite was in '
-    #                         'Nuremberg, Germany in 1662. They used a '
-    #                         'mixture of graphite, sulfur and antimony. '
-    #                         'Though usable, they were not as good as '
-    #                         'the English pencils.',
-    #                 'title': 'Pencil',
-    #                 'wiki-id': '4063'},
-    #     'score': 0.868597746,
-    #     'values': []},
-    #     {'id': 'de9a60b5-73b5-460e-806d-b8356946fc4e',
-    #     'metadata': {'chunk': 0.0,
-    #                 'source': 'https://simple.wikipedia.org/wiki/Printing%20press',
-    #                 'text': 'The printing press is a machine for '
-    #                         'printing. It makes many copies of '
-    #                         'identical pages. The printing press today '
-    #                         'is used to print books and newspapers. It '
-    #                         'had a great influence on society, '
-    #                         'especially western society. It was "one of '
-    #                         'the most potent agents... of western '
-    #                         'civilization in bringing together the '
-    #                         'scattered ideas of thinkers".\n'
-    #                         '\n'
-    #                         'Woodcut printing has been done for several '
-    #                         'centuries. That was whole pages cut into '
-    #                         'wood, words and pictures. In the 15th '
-    #                         'century Johannes Gutenberg improved the '
-    #                         'process. He used separate alloy letters '
-    #                         'screwed into a frame. This way a large set '
-    #                         'of letters could make almost any page for '
-    #                         'printing. This process was called '
-    #                         'typesetting. Each letter was in a block of '
-    #                         'metal, fixed in a frame. He could then '
-    #                         'move paper and ink over it, much like a '
-    #                         'stamp. This method was called letterpress. '
-    #                         'The letters would leave ink on the paper '
-    #                         'in the shape of the letters, creating text '
-    #                         'or illustrations.\n'
-    #                         '\n'
-    #                         'Bigger and much faster presses were '
-    #                         'invented in the industrial revolution. The '
-    #                         'main improvements were made in the 19th '
-    #                         'century. Two ideas altered the design of '
-    #                         'the printing press entirely. First was the '
-    #                         'use of steam power to run the machinery. '
-    #                         'Second was the replacement of the printing '
-    #                         'flatbed with the rotary motion of '
-    #                         'cylinders. Both were done by the German '
-    #                         'printer Friedrich Koenig between 1802 and '
-    #                         '1818. Having moved to London in 1804, '
-    #                         'Koenig got financial support for his '
-    #                         'project in 1807.  In 1810, Koenig patented '
-    #                         'a steam press "much like a hand press '
-    #                         'connected to a steam engine".\n'
-    #                         '\n'
-    #                         'Soon other inventions were added, such as '
-    #                         'the making of cheaper paper by using wood '
-    #                         'pulp instead of rags. Later in the 19th '
-    #                         'century came machines which speeded up '
-    #                         'typesetting, which was previously done by '
-    #                         'hand, letter by letter. A machine for hot '
-    #                         'metal typesetting was designed by Linotype '
-    #                         'Inc. It turned molten lead into type ready '
-    #                         'for printing.',
-    #                 'title': 'Printing press',
-    #                 'wiki-id': '32435'},
-    #     'score': 0.865480721,
-    #     'values': []}],
-    # 'namespace': ''}
+
+    # 検索結果例（コメントアウト）:
+    # - Johannes Gutenbergの記事（スコア: 0.871）→ 最も関連性が高い
+    # - Pencil（鉛筆）の記事（スコア: 0.868）→ 「印刷」に関連する文脈でヒット
+    # - Printing press（印刷機）の記事（スコア: 0.865）→ 直接関連
+    #
+    # スコアはコサイン類似度で、1に近いほど類似性が高い
